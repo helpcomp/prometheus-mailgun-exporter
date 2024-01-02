@@ -7,10 +7,11 @@ import (
 	"os"
 	"time"
 
-	"github.com/mailgun/mailgun-go/v3"
+	"github.com/mailgun/mailgun-go/v4"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/prometheus/common/version"
+	"github.com/prometheus/exporter-toolkit/web"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 	"gopkg.in/alecthomas/kingpin.v2"
@@ -18,6 +19,12 @@ import (
 
 const (
 	namespace = "mailgun"
+)
+
+// Stores Mailgun data in memory so if the exporter fails it will return last known good information
+var (
+	cachedStats   []mailgun.Stats
+	cachedDomains []mailgun.Domain
 )
 
 // Exporter collects metrics from Mailgun's via their API.
@@ -164,6 +171,9 @@ func (e *Exporter) Collect(ch chan<- prometheus.Metric) {
 	if err != nil {
 		ch <- prometheus.MustNewConstMetric(e.up, prometheus.GaugeValue, 0)
 		log.Error().Err(err).Msgf("Scrape of Mailgun's API failed: %s", err)
+		domains = cachedDomains
+	} else {
+		cachedDomains = domains
 	}
 
 	for _, info := range domains {
@@ -178,6 +188,9 @@ func (e *Exporter) Collect(ch chan<- prometheus.Metric) {
 		stats, err := getStats(domain)
 		if err != nil {
 			log.Error().Err(err)
+			stats = cachedStats
+		} else {
+			cachedStats = stats
 		}
 
 		var acceptedTotalIncoming = float64(0)
@@ -343,8 +356,7 @@ func main() {
 	)
 
 	if fileInfo, _ := os.Stdout.Stat(); (fileInfo.Mode() & os.ModeCharDevice) != 0 {
-		log.Logger = log.Output(zerolog.ConsoleWriter{Out: os.Stderr})
-
+		log.Logger = log.Output(zerolog.ConsoleWriter{Out: os.Stdout})
 	}
 
 	kingpin.Version(version.Print("prometheus-mailgun-exporter"))
@@ -353,21 +365,31 @@ func main() {
 	log.Info().Msgf("Starting Mailgun exporter %v", version.Info())
 	log.Info().Msgf("Build context %v", version.BuildContext())
 
+	//pingers := make()
+
 	prometheus.MustRegister(NewExporter())
+
 	http.Handle(*metricsPath, promhttp.Handler())
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte(`<html>
-			<head><title>Mailgun Exporter</title></head>
-            <body>
-            <h1>Mailgun Exporter</h1>
-            <p><a href='` + *metricsPath + `'>Metrics</a></p>
-			<p><a href='/healthz'>Health</a></p>
-            </body>
-            </html>`))
-	})
-	http.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusNoContent)
-	})
+	if *metricsPath != "/" && *metricsPath != "" {
+		landingConfig := web.LandingConfig{
+			Name:        "Mailgun Exporter",
+			Description: "Prometheus Mailgun Exporter",
+			Version:     version.Info(),
+			Links: []web.LandingLinks{
+				{
+					Address: *metricsPath,
+					Text:    "Metrics",
+				},
+			},
+		}
+		landingPage, err := web.NewLandingPage(landingConfig)
+		if err != nil {
+			log.Fatal().Msgf(err.Error())
+			os.Exit(1)
+		}
+		http.Handle("/", landingPage)
+	}
+
 	log.Info().Msgf("Starting HTTP server on listen address %s and metric path %s", *listenAddress, *metricsPath)
 
 	if err := http.ListenAndServe(*listenAddress, nil); err != nil {
