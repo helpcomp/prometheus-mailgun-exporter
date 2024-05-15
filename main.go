@@ -21,9 +21,9 @@ const (
 	namespace = "mailgun"
 )
 
-// Stores Mailgun data in memory so if the exporter fails it will return last known good information
+// Stores Mailgun data in memory so if the exporter fails, it will return last known good information
 var (
-	cachedStats   []mailgun.Stats
+	cachedStats   = make(map[string][]mailgun.Stats)
 	cachedDomains []mailgun.Domain
 )
 
@@ -72,9 +72,8 @@ func prometheusDomainStatsTypeDesc(metric string, help string) *prometheus.Desc 
 // NewExporter returns an initialized exporter.
 func NewExporter() *Exporter {
 	// NewMailgunFromEnv requires MG_DOMAIN to get set, even though we don't need it for listing all domains
-	err := os.Setenv("MG_DOMAIN", "dummy")
-	if err != nil {
-		log.Fatal().Err(err).Msgf("%v", err)
+	if err := os.Setenv("MG_DOMAIN", "dummy"); err != nil {
+		log.Fatal().Err(err).Msg("")
 	}
 
 	mg, err := mailgun.NewMailgunFromEnv()
@@ -83,7 +82,7 @@ func NewExporter() *Exporter {
 		mg.SetAPIBase(APIBase)
 	}
 	if err != nil {
-		log.Fatal().Err(err).Msgf("%v", err)
+		log.Fatal().Err(err).Msgf("")
 	}
 
 	return &Exporter{
@@ -167,13 +166,18 @@ func (e *Exporter) Describe(ch chan<- *prometheus.Desc) {
 // currently ongoing, Collect waits for it to end and then uses its result to
 // collect the metrics.
 func (e *Exporter) Collect(ch chan<- prometheus.Metric) {
-	domains, err := e.listDomains()
+	var err error
+	var domains []mailgun.Domain
+	var stats []mailgun.Stats
+	isUp := 1
+
+	log.Debug().Msgf("Mailgun Refresh.")
+	domains, err = e.listDomains()
 	if err != nil {
-		ch <- prometheus.MustNewConstMetric(e.up, prometheus.GaugeValue, 0)
-		log.Error().Err(err).Msgf("Scrape of Mailgun's API failed: %s", err)
-		domains = cachedDomains
+		log.Error().Err(err).Msgf("Failed retreiving domains from mailgun: %s", err)
+		isUp = 0
 	} else {
-		cachedDomains = domains
+		log.Debug().Msgf("Successfully received %d domains from mailgun", len(domains))
 	}
 
 	for _, info := range domains {
@@ -183,14 +187,13 @@ func (e *Exporter) Collect(ch chan<- prometheus.Metric) {
 		if info.State != "active" {
 			state = 0
 		}
-		ch <- prometheus.MustNewConstMetric(e.state, prometheus.GaugeValue, float64(state), domain)
 
-		stats, err := getStats(domain)
+		stats, err = getStats(domain)
 		if err != nil {
-			log.Error().Err(err)
-			stats = cachedStats
+			log.Error().Err(err).Msgf("Error getting mailgun stats: %s", err)
+			isUp = 0
 		} else {
-			cachedStats = stats
+			log.Debug().Msgf("Mailgun's Stats for %s was successful.", domain)
 		}
 
 		var acceptedTotalIncoming = float64(0)
@@ -299,12 +302,14 @@ func (e *Exporter) Collect(ch chan<- prometheus.Metric) {
 			domain, "esp_block",
 		)
 
+		ch <- prometheus.MustNewConstMetric(e.state, prometheus.GaugeValue, float64(state), domain)
 		ch <- prometheus.MustNewConstMetric(e.openedTotal, prometheus.CounterValue, openedTotal, domain)
 		ch <- prometheus.MustNewConstMetric(e.storedTotal, prometheus.CounterValue, storedTotal, domain)
 		ch <- prometheus.MustNewConstMetric(e.unsubscribedTotal, prometheus.CounterValue, unsubscribedTotal, domain)
 	}
 
-	ch <- prometheus.MustNewConstMetric(e.up, prometheus.GaugeValue, 1)
+	ch <- prometheus.MustNewConstMetric(e.up, prometheus.GaugeValue, float64(isUp))
+	log.Debug().Msgf("Mailgun Call Completed!")
 }
 
 func (e *Exporter) listDomains() ([]mailgun.Domain, error) {
@@ -318,16 +323,16 @@ func (e *Exporter) listDomains() ([]mailgun.Domain, error) {
 	}
 
 	if it.Err() != nil {
-		return nil, it.Err()
+		return cachedDomains, it.Err()
 	}
+	cachedDomains = result
 	return result, nil
 }
 
 func getStats(domain string) ([]mailgun.Stats, error) {
 	// Since we are using NewMailgunFromEnv, we need to set MG_DOMAIN before fetching stats for said domain
-	err := os.Setenv("MG_DOMAIN", domain)
-	if err != nil {
-		log.Error().Err(err)
+	if err := os.Setenv("MG_DOMAIN", domain); err != nil {
+		log.Error().Err(err).Msg("")
 	}
 
 	mg, err := mailgun.NewMailgunFromEnv()
@@ -336,17 +341,24 @@ func getStats(domain string) ([]mailgun.Stats, error) {
 		mg.SetAPIBase(APIBase)
 	}
 	if err != nil {
-		log.Error().Err(err)
+		return cachedStats[domain], err
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second*30)
 	defer cancel()
 
-	return mg.GetStats(ctx, []string{
+	stats, err := mg.GetStats(ctx, []string{
 		"accepted", "clicked", "complained", "delivered", "failed", "opened", "stored", "unsubscribed",
 	}, &mailgun.GetStatOptions{
 		Duration: "240m",
 	})
+
+	if err != nil {
+		return cachedStats[domain], err
+	}
+
+	cachedStats[domain] = stats
+	return stats, nil
 }
 
 func main() {
@@ -365,8 +377,6 @@ func main() {
 	log.Info().Msgf("Starting Mailgun exporter %v", version.Info())
 	log.Info().Msgf("Build context %v", version.BuildContext())
 
-	//pingers := make()
-
 	prometheus.MustRegister(NewExporter())
 
 	http.Handle(*metricsPath, promhttp.Handler())
@@ -383,9 +393,9 @@ func main() {
 			},
 		}
 		landingPage, err := web.NewLandingPage(landingConfig)
+
 		if err != nil {
-			log.Fatal().Msgf(err.Error())
-			os.Exit(1)
+			log.Fatal().Err(err).Msg("")
 		}
 		http.Handle("/", landingPage)
 	}
@@ -393,6 +403,6 @@ func main() {
 	log.Info().Msgf("Starting HTTP server on listen address %s and metric path %s", *listenAddress, *metricsPath)
 
 	if err := http.ListenAndServe(*listenAddress, nil); err != nil {
-		log.Fatal().Err(err).Msgf("%v", err)
+		log.Fatal().Err(err).Msg("")
 	}
 }
